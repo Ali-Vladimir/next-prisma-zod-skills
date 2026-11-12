@@ -24,7 +24,10 @@ están en **español**.
 3. **Construir** capa por capa siguiendo las reglas del servidor: validar con Zod, autenticar,
    autorizar, filtrar por tenant cada consulta e ID relacionado, y agrupar escrituras
    relacionadas en una transacción.
-4. **Verificar y reportar**: typecheck, lint y tests, diciendo qué pasó, qué falló y qué no se
+4. **Escribir el mínimo código**: reutilizar actions, interfaces (`PaginationProps`,
+   `IModeloExtended`) y un solo schema de Zod por modelo, sin mapeos, DTOs ni `select`
+   innecesarios. Nunca a costa de la validación, los permisos o el scope.
+5. **Verificar y reportar**: typecheck, lint y tests, diciendo qué pasó, qué falló y qué no se
    ejecutó. Nunca corre migraciones, deploys ni cambios de dependencias sin que se lo pidas.
 
 Los detalles (paginación, transacciones, Zod 3 vs 4, Prisma 7, integraciones como email,

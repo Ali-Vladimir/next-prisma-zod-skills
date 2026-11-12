@@ -3,11 +3,11 @@
 ## Admin module shape
 
 ```text
-page.tsx (server)
-  └── Manager (client)
-        ├── Table or list
-        ├── Form (inside a dialog or its own route)
-        └── Delete confirmation
+app/(app)/<ruta>/page.tsx          server: reads searchParams, loads data, renders the manager
+app/(app)/<ruta>/ui/
+  <Entity>Manager.tsx              client: search, pagination, dialog, delete confirmation
+  <Entity>Form.tsx                 client: React Hook Form + Zod, calls create-update
+  <Entity>Table.tsx                client: rows and callbacks
 ```
 
 Route groups and layouts stay as the repo defines them. A layout or a hidden menu item is
@@ -15,55 +15,65 @@ navigation, never access control: the actions enforce it.
 
 ## Server page
 
-```typescript
-export default async function ProductsPage({
-    searchParams,
-}: {
-    searchParams: Promise<{ page?: string; search?: string }>;
-}) {
-    const session = await auth();
-    if (!session?.user) redirect("/login");
+The main entity is paginated here, from `searchParams`. Catalogs for selects load in the same
+`Promise.all`, reusing existing actions.
 
-    const { page = "1", search = "" } = await searchParams;   // a Promise since Next.js 15
-    const [products, categories] = await Promise.all([
-        getPaginatedProducts({ page: Number(page), search }),
-        getCategories(),                                    // catalogs for selects
+```typescript
+import type { PaginatedPageProps } from "@/interfaces";
+
+const ProductosPage = async ({ searchParams }: PaginatedPageProps) => {
+    const { page, search } = await searchParams;           // a Promise since Next.js 15
+    const currentPage = Number(page ?? 1);
+    const currentSearch = search ?? "";
+
+    const [{ data, totalPages }, { data: categories }] = await Promise.all([
+        getPaginatedProducts({ page: currentPage, take: 10, search: currentSearch }),
+        getPaginatedCategories({ page: 1, take: 100, isActive: true }),
     ]);
 
-    return <ProductManager initial={products} categories={categories} />;
-}
+    return (
+        <ProductManager
+            data={data ?? []}
+            categories={categories ?? []}
+            totalPages={totalPages ?? 1}
+            currentPage={currentPage}
+            currentSearch={currentSearch}
+        />
+    );
+};
+
+export default ProductosPage;
 ```
 
-Props crossing to client components are serializable: convert `Decimal` and `BigInt`
-values the way the analog does.
+Props crossing to client components are serializable. Prefer `Float`/`Int` columns the way
+the repo does; if a model uses `Decimal` or `BigInt`, follow the analog's conversion.
 
 ## Manager
 
-The client component that coordinates the module. It owns the selected entity, dialog open
-state, delete confirmation, search input, pagination, URL sync, toasts, and the calls to
-mutation actions.
+Props extend the shared type: `interface Props extends PaginatedManagerProps<IProductExtended> { categories: Category[] }`.
+
+It owns the selected entity, dialog open state, delete confirmation, search input, and toasts.
+URL changes go through one `updateUrl` helper (`URLSearchParams` + `router.push`); a new
+search resets `page` to `1`.
 
 ## Form
 
-Owns React Hook Form with the Zod resolver, default values for create and edit, field arrays
-for nested items, payload construction, the action call, and loading state.
-
-A shared form receives `entity: Entity | null`. The entity (or its `id`) decides the heading,
-default values, success message, and whether the action creates or updates.
+- Receives the base model: `product: Product | null`. Its presence decides the heading,
+  the default values, and the success message; the same action creates or updates.
+- `defaultValues` read straight from the entity (`product?.name ?? ""`); dates become
+  `toISOString().slice(0, 10)` for `<input type="date">`.
+- Submits the parsed form data to the action as-is, shows `toast.success` / `toast.error`
+  with the action's `message`, and disables the submit button while pending.
+- A related entity too large to preload (patients, products) is searched from the form: call
+  its paginated action in a debounced `useEffect`.
 
 ## Table or list
 
-Receives data from the manager or page, renders rows, cards, or catalog entries, and emits
-`onCreate`, `onEdit`, `onDelete`. Persistence lives in the actions.
+Props are `PaginatedTableProps<IProductExtended>`. It renders rows (cards on mobile), an
+empty state with a create button, and pagination, and emits `onCreate`, `onEdit`,
+`onDelete`, `onPageChange`.
 
-## URL filters
-
-```text
-page.tsx reads searchParams → Manager reads useSearchParams()
-  → Manager calls router.push() with new params → page.tsx renders again
-```
-
-Changing a search or filter resets `page` to `1`.
+Enum values display through the shared `lib/labels.ts` maps, used by both form and table.
 
 ## Styling
 
@@ -82,6 +92,9 @@ Generated UI is a starting point:
 
 ## Landing and SEO pages
 
-- Copy and metadata come from the real business, audience, and search terms.
+- Copy and metadata come from the real business, audience, and the phrases people actually
+  search ("lentes en León", not the brand name).
 - `metadata`, `robots`, and `sitemap` follow the repo's existing form.
-- A dynamic route exists only when each page carries genuinely different content.
+- One layout can serve several keyphrase routes (city + service) through dynamic
+  `generateMetadata`, as long as each page carries content genuinely useful for that search.
+- Images under 1.5 MB, with `alt` text.
