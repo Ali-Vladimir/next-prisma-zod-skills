@@ -29,8 +29,9 @@ If neither exists, the report names the model as unscoped.
 
 ### Delete strategy
 
-Soft and hard deletes both exist across projects. The model (`deletedAt`, `isActive`,
-`status`) and the existing delete action decide which one an entity uses; it stays that way.
+The model (`isActive`, `status`) and the existing delete action decide which strategy an
+entity uses; it stays that way. A new model that other records reference, and whose history
+must survive, gets `isActive Boolean @default(true)` instead of a hard delete.
 
 ### Schema and migration changes
 
@@ -64,69 +65,66 @@ inside the transaction.
 
 ## Zod
 
-Check the installed major version first. Zod 3 and Zod 4 differ in the places marked below.
+One schema per model, compact: it validates create, update, and the form. Check the
+installed major version first; Zod 3 and Zod 4 differ where marked.
 
 ```typescript
-// Server parse
-const parsed = schema.safeParse(input);
-```
+// schema/sale.schema.ts — the child schema lives in its parent's file
+import { z } from "zod";
+import { PaymentMethod } from "@/app/generated/prisma/enums";   // or "@prisma/client" on Prisma 6
 
-```typescript
-// React Hook Form
-const form = useForm<z.infer<typeof entitySchema>>({
-    resolver: zodResolver(entitySchema),
-});
-// With z.coerce on Zod 4, the input type is `unknown`. Type the form with both sides:
-// useForm<z.input<typeof s>, unknown, z.output<typeof s>>
-```
-
-```typescript
-// Prisma enums (import from the repo's Prisma Client path)
-role: z.nativeEnum(Role),   // Zod 3
-role: z.enum(Role),         // Zod 4 (nativeEnum is deprecated)
-```
-
-```typescript
-// Optional, nullable, defaults
-id: z.number().optional(),
-notes: z.string().nullish(),
-isActive: z.boolean().default(true),   // only when the domain has a real default
-```
-
-```typescript
-// Coercion: only for string input (forms, FormData, query strings)
-amount: z.coerce.number(),
-date: z.coerce.date(),
-```
-
-```typescript
-// Empty strings from forms → null
-notes: z.preprocess(v => (v === "" ? null : v), z.string().nullish()),
-```
-
-```typescript
-// Cross-field rule
-.refine(d => d.clientId || d.newClient, {
-    message: "Selecciona o crea un cliente",   // Zod 4 also accepts `error:`
-    path: ["clientId"],
-})
-```
-
-```typescript
-// Nested payload for records saved together
-const recipeSchema = z.object({
+export const saleItemSchema = z.object({
     id: z.number().optional(),
-    name: z.string().min(1),
-    items: z.array(z.object({
-        ingredientId: z.number().int().min(1),
-        quantity: z.number().positive(),
-    })).min(1),
+    productId: z.number(),
+    quantity: z.number().positive(),
+    pricePerUnit: z.number(),
 });
+
+// soldById comes from the session in the action, not from the payload.
+export const saleSchema = z.object({
+    id: z.number().optional(),                      // absent on create
+    clientId: z.number().nullable().optional(),
+    paymentMethod: z.enum(PaymentMethod),           // Zod 3: z.nativeEnum(PaymentMethod)
+    saleDate: z.string().optional(),                // ISO string from the input, converted in the action
+    notes: z.string().optional(),
+    isActive: z.boolean().default(true),
+    items: z.array(saleItemSchema).min(1),
+});
+
+export type SaleInput = z.infer<typeof saleSchema>;
 ```
 
 Rules:
 
-- One schema serves create and update unless the module already splits them.
-- The client and the server use the same schema; the server always parses again.
-- `preprocess` and `default` appear only where the domain requires them.
-- Error messages are written in the project's user-facing language.
+- Fields mirror the Prisma model: `?` in Prisma is `.optional()` (or `.nullable().optional()`
+  when the form can clear it). Database-managed fields (`createdAt`, `updatedAt`) and
+  session-owned fields (tenant, author) stay out of the schema.
+- Dates travel as strings (`<input type="date">` gives one) and become `Date` in the action:
+  `followUpDueOn: rest.followUpDueOn ? new Date(rest.followUpDueOn) : null`.
+- Enums come from the Prisma Client, so Zod and the database share one list.
+- `.default()` only where the domain has a real default.
+- Empty strings from forms become `null` only where `""` breaks something: unique columns
+  and optional enums. One shared helper does it:
+
+```typescript
+// schema/helpers.ts
+export const emptyToNull = (value: unknown) =>
+    typeof value === "string" && value.trim() === "" ? null : value;
+
+code: z.preprocess(emptyToNull, z.string().nullable().optional()),
+```
+
+- Cross-field rules use `.refine(..., { message, path })` (Zod 4 also accepts `error:`).
+- `z.coerce` is for raw strings only (`FormData`, query strings), not for React Hook Form
+  inputs that already hold numbers.
+- Messages are in the app's language.
+
+React Hook Form uses the same schema. When it has `.default()`, `preprocess`, or `coerce`,
+input and output types differ; type the form with both:
+
+```typescript
+const form = useForm<z.input<typeof saleSchema>, unknown, z.output<typeof saleSchema>>({
+    resolver: zodResolver(saleSchema),
+    defaultValues: { id: sale?.id, notes: sale?.notes ?? "", items: [] },
+});
+```

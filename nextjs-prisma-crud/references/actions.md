@@ -2,123 +2,122 @@
 
 ## File layout
 
-Mirror the analog's folder. The common layout per entity:
+Mirror the analog's folder (defaults in `conventions.md`): `create-update-<entity>.ts`,
+`delete-<entity>.ts`, `get-paginated-<entity>.ts`, `get-<entity>-by-id.ts` when a detail page
+needs it, and the `index.ts` barrel. Domain actions (payments, sales, enrollments) sit next to
+these.
 
-```text
-actions/<entity>/
-  create-update-<entity>.ts
-  delete-<entity>.ts
-  get-<entity>-by-id.ts
-  get-paginated-<entity>.ts
-  index.ts                  (only if the folder already uses a barrel file)
+Before adding a read action, check whether an existing one already answers it. Catalogs for
+selects reuse the entity's paginated action:
+
+```typescript
+// shortcut: first 100 active categories, switch to a dedicated get-* if a tenant exceeds it.
+getPaginatedCategories({ page: 1, take: 100, isActive: true })
 ```
-
-Domain actions (payments, sales, enrollments) sit next to these.
 
 ## Lifecycle
 
-The order inside a mutating action:
-
 ```text
 'use server' → auth → permission → safeParse → scope checks (record + related IDs)
-  → transaction (mutations + audit) → revalidate → after() effects → response
+  → transaction (mutation + audit) → revalidate → after() effects → response
 ```
 
-A skeleton with every step. Names, helpers, messages, and the response shape come from the
-analog; the order and the checks are the part to keep.
+A skeleton in the house style. Names, helpers, and messages come from the analog; the order
+and the checks are the part to keep.
 
 ```typescript
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { auth } from "@/auth";                      // the repo's session helper
-import { prisma } from "@/lib/prisma";              // the repo's client instance
-import { productSchema } from "@/schema/product.schema";
+import { Prisma } from "@/app/generated/prisma/client";  // "@prisma/client" on Prisma 6
+import { auth } from "@/auth";
+import prisma from "@/lib/prisma";                         // the repo's client instance
+import { productSchema } from "@/schema";
+import { createAuditLogTx } from "@/actions/audit-log";
 
-export async function createUpdateProduct(input: unknown) {
+export async function createUpdateProduct(data: unknown) {
     const session = await auth();
-    if (!session?.user) return { ok: false, message: "No autorizado" };
-    if (!can(session.user, "products:write")) return { ok: false, message: "Sin permiso" };
+    if (!session?.user) return { ok: false, message: "Tu sesión expiró. Inicia sesión de nuevo." };
 
-    const parsed = productSchema.safeParse(input);
-    if (!parsed.success) return { ok: false, message: "Datos inválidos" };
+    const parsed = productSchema.safeParse(data);
+    if (!parsed.success) return { ok: false, message: "Los datos del producto son inválidos." };
 
-    const { id, categoryId, ...data } = parsed.data;
-    const companyId = session.user.companyId;
+    const { id, ...rest } = parsed.data;
+    const companyId = Number(session.user.companyId);
 
     try {
         await prisma.$transaction(async (tx) => {
-            // Related ID: must belong to the same tenant.
-            const category = await tx.category.findFirst({
-                where: { id: categoryId, companyId },
-                select: { id: true },
+            // Scoped lookups: the existing record and every related ID belong to this tenant.
+            const before = id ? await tx.product.findFirst({ where: { id, companyId } }) : null;
+            if (id && !before) throw new Error("NOT_IN_SCOPE");
+
+            const category = await tx.category.findFirst({ where: { id: rest.categoryId, companyId } });
+            if (!category) throw new Error("NOT_IN_SCOPE");
+
+            const saved = await tx.product.upsert({
+                where: { id: id ?? 0 },
+                update: rest,
+                create: { ...rest, companyId },
             });
-            if (!category) throw new Error("CATEGORY_NOT_IN_SCOPE");
 
-            const product = id
-                ? await tx.product.update({
-                      where: { id, companyId },     // throws P2025 if out of scope
-                      data: { ...data, categoryId },
-                  })
-                : await tx.product.create({
-                      data: { ...data, categoryId, companyId },
-                  });
-
-            await createAuditLogTx(tx, { entity: "product", entityId: product.id, userId: session.user.id });
+            await createAuditLogTx(tx, { userId: Number(session.user.id), entity: "Product", before, after: saved });
         });
     } catch (error) {
-        return { ok: false, message: "No se pudo guardar el producto" };
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+            return { ok: false, message: "Ya existe un producto con ese código." };
+        }
+        console.error(error);
+        return { ok: false, message: "No se pudo guardar el producto. Intenta de nuevo." };
     }
 
     revalidatePath("/productos");
-    return { ok: true, message: id ? "Producto actualizado" : "Producto creado" };
+    return { ok: true, message: `Producto ${id ? "actualizado" : "creado"} correctamente.` };
 }
 ```
 
-Since Prisma 5, `update` and `delete` accept non-unique filters (`companyId`) next to the
-unique key in `where`, and throw `P2025` when the scoped record does not exist. That makes the
-ownership check and the write a single call.
+The `before` lookup does double duty: it is the audit's old value and the ownership check.
+Without the scope, `upsert({ where: { id } })` lets a user of one tenant overwrite another
+tenant's row.
 
-## Create and update
+Every value passed to Prisma comes from `parsed.data`. Fields the server owns (`companyId`,
+`createdById`, `reportedById`) come from the session, never from the payload.
 
-Before writing a create/update action, read in the analog:
+## Error messages
 
-1. `upsert` or explicit branching on `id`.
-2. How relation sets are saved: replaced (`deleteMany` + `createMany`), diffed, or updated one by one.
-3. Whether audit runs inside the transaction.
-4. The response shape.
+Translate known Prisma errors into a sentence that tells the user what to do:
 
-Every value passed to Prisma comes from `parsed.data`, never from the raw input.
+| Code | Meaning | Typical message |
+| --- | --- | --- |
+| `P2002` | Unique constraint | "Ya existe un registro con ese código." |
+| `P2025` | Record not found (or filtered out by a scoped `where`) | "El registro no existe o no tienes acceso." |
+| `P2003` | Foreign key blocks the delete | "No se puede eliminar porque tiene registros relacionados; desactívalo." |
+
+Unknown errors are logged with `console.error` and get a generic retry message.
 
 ## Pagination
 
 ```typescript
-const where = { companyId, name: { contains: search, mode: "insensitive" as const } };
-const skip = (page - 1) * take;
+export async function getPaginatedProducts({ page, take = 10, search = "", isActive }: PaginationProps) {
+    // auth + tenant from the session, as above
+    const where = {
+        companyId,
+        ...(isActive !== undefined && { isActive }),
+        ...(search && { name: { contains: search, mode: "insensitive" as const } }),
+    };
 
-const [data, totalCount] = await Promise.all([
-    prisma.entity.findMany({ where, skip, take, orderBy: { name: "asc" } }),
-    prisma.entity.count({ where }),
-]);
+    const [data, totalCount] = await Promise.all([
+        prisma.product.findMany({ where, skip: (page - 1) * take, take, include: { category: true }, orderBy: { createdAt: "desc" } }),
+        prisma.product.count({ where }),
+    ]);
 
-return { ok: true, data, page, totalPages: Math.ceil(totalCount / take), totalCount };
+    return { ok: true, data, page, totalPages: Math.ceil(totalCount / take), totalCount };
+}
 ```
 
-The tenant scope is part of `where` for both queries. `mode: "insensitive"` exists only on
-PostgreSQL and MongoDB; match what the analog does for search.
-
-## Response shapes
-
-There is no universal contract. Shapes seen across projects:
-
-```typescript
-{ ok: true, message }
-{ ok: true, data }
-{ ok: true, data, page, totalPages, totalCount }
-{ ok: false, message }
-```
-
-New actions return exactly the shape their module already returns.
+- The tenant scope is part of `where`, shared by both queries.
+- `data` is returned as Prisma gives it and typed by `I<Model>Extended` at the consumer.
+- `mode: "insensitive"` exists only on PostgreSQL and MongoDB; on MySQL/MariaDB the
+  collation already ignores case.
 
 ## Transactions
 
@@ -126,8 +125,7 @@ Use one transaction when a change touches several related records, balances, inv
 its movements, a sale and its items, relations that must stay in sync, or an audit record that
 must be atomic with the change.
 
-- Reads that the checks depend on happen inside the transaction when they must be consistent
-  with the writes.
+- Reads that the checks depend on happen inside the transaction.
 - **Returning a value from the callback commits.** A callback that returns
   `{ ok: false }` after some writes leaves those writes in the database. To roll back,
   throw; then catch outside and return the failure response.
@@ -137,24 +135,23 @@ must be atomic with the change.
 ## Revalidation
 
 Revalidate only what shows the changed data, with the API the repo already uses
-(`revalidatePath`, `revalidateTag`, or `updateTag` on Next.js 16):
-
-```typescript
-revalidatePath("/productos");
-revalidatePath("/pos");
-```
+(`revalidatePath`, `revalidateTag`, or `updateTag` on Next.js 16).
 
 ## `after()`
 
-`after()` runs after the response is sent: email, WhatsApp, low-stock alerts, secondary
-revalidation. If the process stops, the work is lost, and it can run zero or more times.
-Keep every step the business result depends on before the response.
+`after()` (from `next/server`) runs after the response is sent: email, WhatsApp, low-stock
+alerts. If the process stops, the work is lost, and it can run zero or more times. Every step
+the business result depends on happens before the response.
 
 ## Deletes
 
-Follow the entity's existing strategy, after reading the relation's `onDelete` rules:
+Follow the entity's strategy, after reading the relation's `onDelete` rules:
 
-- Soft delete: set the flag or `deletedAt`, and every read filters it out.
-- Hard delete: remove the row; check cascades and restricted relations first.
+- `isActive` models: the delete action sets `isActive: false`, and lists filter
+  `isActive: true` by default.
+- Hard delete: remove the row. Business conditions go in the scoped `where`, so a row that
+  does not qualify throws `P2025`:
 
-Deletes are scoped like any other write: `where: { id, companyId }`.
+```typescript
+await tx.finding.delete({ where: { id, companyId, status: "OPEN" } });
+```

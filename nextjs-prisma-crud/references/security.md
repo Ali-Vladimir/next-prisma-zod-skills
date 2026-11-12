@@ -13,14 +13,16 @@ Check each action in scope for every item. These show up repeatedly in admin cod
    is loaded by `id` alone, so any tenant's record can be changed.
 3. **Unscoped detail or delete**: `get-by-id` or `delete` uses `where: { id }` with no tenant
    field.
-4. **Parent scoped, children not**: the parent record is checked, but child IDs in the payload
+4. **Scope only on create**: the `upsert` puts the tenant field in `create` but loads or
+   updates by `id` alone, so any tenant can edit the row by sending its `id`.
+5. **Parent scoped, children not**: the parent record is checked, but child IDs in the payload
    (`variantId`, `courseId`, `accountId`) are trusted.
-5. **Swallowed transaction failure**: the callback returns a failure value (which commits the
+6. **Swallowed transaction failure**: the callback returns a failure value (which commits the
    writes so far) and the action returns `ok: true` anyway.
-6. **Audit outside the transaction**: the audit helper is called with `prisma` instead of `tx`.
-7. **Data leak**: the response returns password hashes, tokens, or internal fields because it
-   has no `select`.
-8. **Client-only guard**: the only protection is a hidden button, a layout check, or a role
+7. **Audit outside the transaction**: the audit helper is called with `prisma` instead of `tx`.
+8. **Data leak**: the response includes a whole user relation, with its password hash or
+   tokens, instead of a safe type (`IUserSafe`, `IUserSummary`).
+9. **Client-only guard**: the only protection is a hidden button, a layout check, or a role
    check in a client component.
 
 Scope examples worth testing against: a product variant belongs to the current company; a
